@@ -4,148 +4,140 @@ import argparse
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
-
-from argparse import HelpFormatter
-from operator import attrgetter
 from pathlib import Path
 from typing import Tuple
 
-enable_debug = False
-debug_level = 1
+from shared_libs.argparse_utils import SortingHelpFormatter
+from shared_libs.debug_utils import Debugger
+from shared_libs.sentry_bootstrap import init as sentry_init
+
+debugger = Debugger()
 
 
-class SortingHelpFormatter(HelpFormatter):
-    def add_arguments(self, actions):
-        actions = sorted(actions, key=attrgetter('option_strings'))
-        super(SortingHelpFormatter, self).add_arguments(actions)
-
-
-def check_encryption(book: Path) -> tuple[str, str]:
+def check_encryption(book: Path) -> Tuple[str, str]:
     """
     Check if a book is encrypted.
 
-    :param book: The path to the book file.
-    :return: A tuple containing the encryption status ('Encrypted' or 'Not Encrypted') and the name of the book.
+    :param book: Path to the book file.
+    :return: Tuple of ('Encrypted' or 'Not Encrypted', book name).
     """
     try:
-        book_data = subprocess.check_output(['file', '--brief', book])
-        debug(f"Raw book data: {book_data}")
+        result = subprocess.run(
+            ["file", "--brief", str(book)],
+            capture_output=True, text=True, check=True
+        )
+        book_data = result.stdout
+        debugger.log(f"Raw book data: {book_data}", 3)
 
-        name = book_data.decode('utf-8').split('"')[1]
-        debug(f"Book name: {name}", 2)
-
-        if 'encrypted' in book_data.decode('utf-8'):
-            debug(f"Book is encrypted: {book}", 2)
-            return 'Encrypted', name
+        name = Path(book).stem
+        if "encrypted" in book_data.lower():
+            debugger.log(f"Book is encrypted: {book}", 2)
+            return "Encrypted", name
         else:
-            debug(f"Book is not encrypted: {book}", 2)
-            return 'Not Encrypted', name
+            debugger.log(f"Book is not encrypted: {book}", 2)
+            return "Not Encrypted", name
     except subprocess.CalledProcessError as e:
         print(f"Error processing {book}: {e}")
+        return "Unknown", Path(book).stem
 
 
-def debug(msg: str = '', debug_msg_level: int = 1, output=sys.stdout) -> None:
+def download_files(tmp_directory: Path) -> None:
     """
-    Prints the debug message if debug mode is enabled and the debug level is less than or equal to the debug level.
+    Download files from an Android tablet to the local filesystem.
 
-    :param msg: A string that represents the message to be printed. Default is an empty string.
-    :param debug_msg_level: An integer that represents the debug message level. Default is 1.
-    :param output: The output stream where the debug message will be printed. Default is sys.stdout.
-
-    :return: None
+    :param tmp_directory: Temporary directory for downloaded files.
     """
-    if enable_debug and debug_msg_level <= debug_level:
-        if debug_level == 1:
-            message = msg
-        else:
-            message = f"DEBUG[{debug_msg_level}]: {msg}"
-        output.write(f"{message}\n")
-
-
-def download_files(tmp_directory: str) -> None:
-    """
-    Download files from an android tablet to the local filesystem
-
-    :param tmp_directory: The temporary directory where the files will be downloaded to.
-    :return: None
-    """
-    debug(f"Using tmp folder: {tmp_directory}", 2)
+    debugger.log(f"Using tmp folder: {tmp_directory}", 2)
 
     try:
-        run_command = list(
-            f"/usr/local/bin/adb pull /sdcard/Android/data/com.amazon.kindle/files/ {tmp_directory}".split(' '))
-        debug(f"Will run command: {' '.join(run_command)}", 2)
-        print('Pulling books from tablet')
-        file_copy = subprocess.check_output(run_command)
+        run_command = [
+            "/usr/local/bin/adb", "pull",
+            "/sdcard/Android/data/com.amazon.kindle/files/",
+            str(tmp_directory)
+        ]
+        debugger.log(f"Will run command: {' '.join(run_command)}", 2)
+        print("Pulling books from tablet")
 
-        debug(f"adb output: {file_copy.decode('utf-8')}", 3)
-
+        result = subprocess.run(run_command, capture_output=True, text=True, check=True)
+        debugger.log(f"adb output: {result.stdout}", 3)
     except subprocess.CalledProcessError as e:
         print(f"adb command failed with error: {e}")
         raise
 
 
-def parse_args():
-    """
-    Parses command line arguments for the program.
-
-    :return: An instance of the argparse.Namespace class containing the parsed arguments.
-    """
-    parser = argparse.ArgumentParser(formatter_class=SortingHelpFormatter)
-    parser.add_argument('-l', '--debug_level', type=int, choices=[1, 2, 3], required=False,
-                        help='Set debug level (enabled debugging)')
-    parser.add_argument('-t', '--temp_dir', required=False,
-                        default=f"{Path(tempfile.gettempdir()).joinpath('tmp_books')}",
-                        help='Temporary folder to use when copying books')
-    parser.add_argument('-o', '--output_dir', required=False,
-                        default=f"{Path('~').expanduser()}", help='Folder to output prc files to')
-    return parser.parse_args()
-
-
 def process_books(in_dir: Path, out_dir: Path) -> None:
     """
-    Process books in the input directory and move them to the output directory.
+    Process books in the input directory and copy them to the output directory.
 
-    :param in_dir: The input directory where the books are located.
-    :param out_dir: The output directory where the books will be moved.
-    :return: None
+    :param in_dir: Directory with the downloaded books.
+    :param out_dir: Directory to copy PRC files into.
     """
     try:
-        debug(f"Will write books to: {out_dir}")
+        debugger.log(f"Will write books to: {out_dir}")
 
         if not out_dir.is_dir():
-            debug(f"Creating output directory: {out_dir}", 2)
-            os.makedirs(out_dir)
+            debugger.log(f"Creating output directory: {out_dir}", 2)
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-        for foldername, subfolders, filenames in os.walk(in_dir):
+        for foldername, _, filenames in os.walk(in_dir):
             for filename in filenames:
-                if filename.endswith('.prc'):
-                    debug(f"Found file: {filename}", 2)
-                    _, name = check_encryption(Path(foldername).joinpath(filename))
-                    if not out_dir.joinpath(filename).is_file():
-                        if not out_dir.is_dir():
-                            debug(f"Creating output directory: {out_dir}/", 2)
-                            os.makedirs(out_dir)
+                if filename.endswith(".prc"):
+                    full_path = Path(foldername).joinpath(filename)
+                    debugger.log(f"Found file: {filename}", 2)
+                    _, name = check_encryption(full_path)
+
+                    target = out_dir.joinpath(filename)
+                    if not target.is_file():
                         print(f"{name}")
-                        shutil.copy(os.path.join(foldername, filename), out_dir)
+                        shutil.copy(full_path, out_dir)
                     else:
-                        debug('File already exists, skipping move', 2)
+                        debugger.log(f"File {filename} already exists, skipping", 2)
 
     except Exception as e:
         print(f"Error moving books: {e}")
+        debugger.log(f"Error moving books: {e}", 1)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        formatter_class=SortingHelpFormatter,
+        description="Pull Kindle books from an Android device and copy PRC files."
+    )
+    parser.add_argument(
+        "-l", "--debug_level", type=int, choices=[1, 2, 3], required=False,
+        help="Set debug level (enables debugging)"
+    )
+    parser.add_argument(
+        "-t", "--temp_dir", required=False,
+        default=f"{Path(tempfile.gettempdir()) / 'tmp_books'}",
+        help="Temporary folder to use when copying books"
+    )
+    parser.add_argument(
+        "-o", "--output_dir", required=False,
+        default=f"{Path('~').expanduser()}",
+        help="Folder to output PRC files to"
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
+    try:
+        sentry_init(debug_hook=debugger.log)
 
-    if args.debug_level:
-        enable_debug = True
-        debug_level = args.debug_level
-        debug(f"Set debug level to: {debug_level}")
+        args = parse_args()
 
-    debug(f"Using tmp dir: {args.temp_dir}")
+        if args.debug_level:
+            debugger.set_level(args.debug_level)
+            debugger.log(f"Set debug level to: {args.debug_level}")
 
-    download_files(args.temp_dir)
-    process_books(Path(args.temp_dir).expanduser(), Path(args.output_dir).expanduser())
+        tmp_dir = Path(args.temp_dir).expanduser()
+        out_dir = Path(args.output_dir).expanduser()
+
+        debugger.log(f"Using tmp dir: {tmp_dir}")
+        download_files(tmp_dir)
+        process_books(tmp_dir, out_dir)
+
+    except Exception as e:
+        debugger.log(f"Unhandled exception: {e}", 1)
+        raise
